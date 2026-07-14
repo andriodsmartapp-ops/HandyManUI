@@ -37,6 +37,71 @@ const clampQtyFor = (product, qty) => {
   return Math.min(n, limit, stock);
 };
 
+const INITIAL_IMAGE_COUNT = 12;
+const IMAGE_FETCH_CONCURRENCY = 4;
+const INITIAL_VISIBLE_PRODUCTS = 8;
+const PRODUCT_REVEAL_STEP = 6;
+const PRODUCT_REVEAL_DELAY = 110;
+const OFFER_SKELETON_COUNT = 8;
+
+const loadOfferImage = async ({ productId, photo, signal }) => {
+  if (!photo) return null;
+
+  const blobUrl = ImageCache.getBlobUrl(photo);
+  if (blobUrl) {
+    return { productId, dataUrl: blobUrl };
+  }
+
+  const cached = await ImageCache.getBase64(photo);
+  if (cached) {
+    return {
+      productId,
+      dataUrl: ImageCache.getOrCreateObjectUrl(photo, cached),
+    };
+  }
+
+  const res = await fetch(
+    `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=${encodeURIComponent(photo)}`,
+    { signal },
+  );
+  const json = await res.json();
+  const b64 = json?.imageData || "";
+  if (!b64) return null;
+
+  await ImageCache.setBase64(photo, b64);
+  return {
+    productId,
+    dataUrl: ImageCache.getOrCreateObjectUrl(photo, b64),
+  };
+};
+
+const hydrateOfferImages = async ({ items, signal, onResolved, concurrency = IMAGE_FETCH_CONCURRENCY }) => {
+  const queue = Array.isArray(items) ? [...items] : [];
+  const workerCount = Math.min(concurrency, queue.length);
+
+  if (!workerCount) return;
+
+  const worker = async () => {
+    while (queue.length) {
+      const next = queue.shift();
+      if (!next || signal?.aborted) return;
+
+      try {
+        const resolved = await loadOfferImage({ ...next, signal });
+        if (resolved && !signal?.aborted) {
+          onResolved?.(resolved);
+        }
+      } catch (err) {
+        if (err?.name !== "AbortError" && err?.name !== "CanceledError") {
+          console.error("offer image hydrate failed:", err);
+        }
+      }
+    }
+  };
+
+  await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
+};
+
 const GroceryOfferItems = () => {
   const navigate = useNavigate();
   const { userType, userId, selectedUserType } = useParams();
@@ -45,6 +110,7 @@ const GroceryOfferItems = () => {
   const [products, setProducts] = useState([]);
   const [imageUrls, setImageUrls] = useState({});
   const [imageLoading, setImageLoading] = useState(true);
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_PRODUCTS);
   // const [showZoomModal, setShowZoomModal] = useState(false);
   // const [zoomImage, setZoomImage] = useState("");
   const [cart, setCart] = useState({});
@@ -235,103 +301,96 @@ const GroceryOfferItems = () => {
   }
 
   useEffect(() => {
-    if (!selectedCategory) return;     
+    if (!selectedCategory) return;
     let cancelled = false;
     const controller = new AbortController();
-    async function fetchProductsAndFirstImages(warm = false, signal) {
+
+    const applyResolvedImage = ({ productId, dataUrl }) => {
+      if (!productId || !dataUrl || cancelled) return;
+      setImageUrls((prev) => {
+        if (prev[productId]?.[0] === dataUrl) return prev;
+        return { ...prev, [productId]: [dataUrl] };
+      });
+    };
+
+    async function fetchProductsAndImages(signal) {
       try {
-        if (!warm) setImageLoading(true);
+        setImageLoading(true);
+        setImageUrls({});
+
         const url = `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/UploadGrocery/GetGroceryItemsBycategory?Category=${encodeURIComponent(
           selectedCategory,
         )}`;
         const { data: items } = await axios.get(url, { signal });
         const safeItems = Array.isArray(items) ? items : [];
         if (cancelled) return;
-        const sorted = [...safeItems].sort((a, b) => {
-          const stockA = Number(a.stockLeft || 0);
-          const stockB = Number(b.stockLeft || 0);
-          if (stockA <= 0 && stockB > 0) return 1;
-          if (stockA > 0 && stockB <= 0) return -1;
-          const timeA = getItemTime(a);
-          const timeB = getItemTime(b);
-          if (timeA !== timeB) return timeB - timeA;
-          return String(b.id).localeCompare(String(a.id));
-        });
-        setProducts(sorted);
-        if (warm) return;
-        const firstImages = safeItems
-          .map((p) => ({
-            productId: p.id,
-            photo: Array.isArray(p.images) ? p.images[0] : null,
+
+        const selectedCategoryLower = String(selectedCategory).toLowerCase();
+        const sortedOffers = [...safeItems]
+          .filter(
+            (item) =>
+              String(item?.category || "").toLowerCase() === selectedCategoryLower &&
+              item?.status === "Approved" &&
+              Number(item?.discount) > 0,
+          )
+          .sort((a, b) => {
+            const stockA = Number(a.stockLeft || 0);
+            const stockB = Number(b.stockLeft || 0);
+            if (stockA <= 0 && stockB > 0) return 1;
+            if (stockA > 0 && stockB <= 0) return -1;
+            const timeA = getItemTime(a);
+            const timeB = getItemTime(b);
+            if (timeA !== timeB) return timeB - timeA;
+            return String(b.id).localeCompare(String(a.id));
+          });
+
+        setProducts(sortedOffers);
+        setVisibleCount(Math.min(INITIAL_VISIBLE_PRODUCTS, sortedOffers.length || INITIAL_VISIBLE_PRODUCTS));
+        setImageLoading(false);
+
+        const imageQueue = sortedOffers
+          .map((product) => ({
+            productId: product.id,
+            photo: Array.isArray(product.images) ? product.images[0] : null,
           }))
-          .filter((x) => !!x.photo);
-        const cachedMap = {};
-        const misses = [];
-        for (const { productId, photo } of firstImages) {
-          const blobUrl = ImageCache.getBlobUrl(photo);
-          if (blobUrl) {
-            cachedMap[productId] = [blobUrl];
-            continue;
-          }
+          .filter((item) => !!item.photo);
 
-          const cached = await ImageCache.getBase64(photo);
-          if (cached) {
-            const dataUrl = `data:image/jpeg;base64,${cached}`;
-            ImageCache.setBlobUrl(photo, dataUrl); 
-            cachedMap[productId] = [dataUrl];
-          } else {
-            misses.push({ productId, photo });
-          }
+        const initialImages = imageQueue.slice(0, INITIAL_IMAGE_COUNT);
+        const deferredImages = imageQueue.slice(INITIAL_IMAGE_COUNT);
+
+        await hydrateOfferImages({
+          items: initialImages,
+          signal,
+          concurrency: IMAGE_FETCH_CONCURRENCY,
+          onResolved: applyResolvedImage,
+        });
+
+        if (!cancelled && deferredImages.length) {
+          void hydrateOfferImages({
+            items: deferredImages,
+            signal,
+            concurrency: IMAGE_FETCH_CONCURRENCY,
+            onResolved: applyResolvedImage,
+          });
         }
-        if (Object.keys(cachedMap).length) {
-          setImageUrls((prev) => ({ ...prev, ...cachedMap }));
-        }
-        if (cancelled) return;
-        const fetchOne = async ({ productId, photo }) => {
-          try {
-            const res = await fetch(
-              `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=${encodeURIComponent(photo)}`,
-              { signal },  
-            );
-            const json = await res.json();
-            const b64 = json?.imageData || "";
-            if (!b64) return;
-
-            await ImageCache.setBase64(photo, b64);
-            const dataUrl = `data:image/jpeg;base64,${b64}`;
-
-            ImageCache.setBlobUrl(photo, dataUrl);
-
-            if (!cancelled) {
-              setImageUrls((prev) => {
-                if (prev[productId]?.[0] === dataUrl) return prev;
-                return { ...prev, [productId]: [dataUrl] };
-              });
-            }
-          } catch (err) {
-            console.error("fetchOne failed:", err); 
-          }
-        };
-        await Promise.allSettled(misses.map(fetchOne));
       } catch (err) {
         if (err?.name !== "CanceledError" && err?.name !== "AbortError") {
           console.error("Error fetching grocery products:", err);
-          if (!warm) {
+          if (!cancelled) {
             setProducts([]);
             setImageUrls({});
+            setImageLoading(false);
           }
         }
-      } finally {
-        if (!cancelled && !warm) setImageLoading(false);
       }
     }
 
-    fetchProductsAndFirstImages(false, controller.signal);
- return () => {
+    fetchProductsAndImages(controller.signal);
+    return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [selectedCategory]);         
+  }, [selectedCategory]);
 
   useEffect(() => {
     let savedCategories = [];
@@ -357,6 +416,50 @@ const GroceryOfferItems = () => {
       setCart(restoredCart);
     }
   }, [encodedCategory]);
+
+  const filteredProducts = products.filter(
+    (p) =>
+      p.category?.toLowerCase() === selectedCategory.toLowerCase() &&
+      p.status === "Approved" &&
+      Number(p.discount) > 0 &&
+      (searchQuery === "" ||
+        p.name?.toLowerCase().includes(searchQuery.toLowerCase())),
+  );
+
+  useEffect(() => {
+    if (!filteredProducts.length) {
+      setVisibleCount(INITIAL_VISIBLE_PRODUCTS);
+      return undefined;
+    }
+
+    if (searchQuery.trim()) {
+      setVisibleCount(filteredProducts.length);
+      return undefined;
+    }
+
+    setVisibleCount((prev) => Math.max(Math.min(prev || INITIAL_VISIBLE_PRODUCTS, filteredProducts.length), Math.min(INITIAL_VISIBLE_PRODUCTS, filteredProducts.length)));
+
+    if (visibleCount >= filteredProducts.length) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setVisibleCount((prev) => Math.min(prev + PRODUCT_REVEAL_STEP, filteredProducts.length));
+    }, PRODUCT_REVEAL_DELAY);
+
+    return () => window.clearTimeout(timer);
+  }, [filteredProducts.length, searchQuery, visibleCount]);
+
+  const visibleProducts = filteredProducts.slice(0, visibleCount);
+  const loadedImageCount = filteredProducts.reduce(
+    (count, product) => count + (imageUrls[product.id]?.[0] ? 1 : 0),
+    0,
+  );
+  const maxDiscount = filteredProducts.reduce(
+    (max, product) => Math.max(max, Number(product.discount) || 0),
+    0,
+  );
+  const savingsLabel = maxDiscount > 0 ? `Up to ${Math.round(maxDiscount)}% OFF` : "Fresh offers live now";
 
   return (
     <>
@@ -480,289 +583,222 @@ const GroceryOfferItems = () => {
 
             {selectedCategory && (
               <>
-                <div
-                  className="d-flex justify-content-end"
-                  style={{ marginTop: "90px" }}
-                >
-                  <span className="text-success text-xs">
-                    Selected Qty:{" "}
-                    <span className="text-danger fw-bold">
-                      {Object.values(cart).reduce((sum, qty) => sum + qty, 0)}
-                    </span>
-                  </span>
+                <div className="offer-feed-shell" style={{ marginTop: "90px" }}>
+                  <div className="offer-hero-banner">
+                    <div>
+                      <div className="offer-hero-pill">Lightning deals</div>
+                      <h3 className="offer-hero-title">{selectedCategory}</h3>
+                      <p className="offer-hero-subtitle">
+                        Fast deals feed with instant cards, quick image fill, and better shopping flow.
+                      </p>
+                    </div>
+                    <div className="offer-hero-price">{savingsLabel}</div>
+                  </div>
 
-                  <span className="text-success text-xs ms-2">
-                    Total Price: Rs{" "}
-                    <span className="text-danger fw-bold">
-                      {Math.round(
-                        Object.entries(cart).reduce((sum, [productId, qty]) => {
-                          const product = products.find(
-                            (p) => String(p.id) === String(productId),
-                          );
-                          return (
-                            sum +
-                            (product ? Number(product.afterDiscount) * qty : 0)
-                          );
-                        }, 0),
-                      )}
-                    </span>
-                    /-
-                  </span>
-                </div>
+                  <div className="offer-stats-row">
+                    <div className="offer-stat-chip">
+                      <span className="offer-stat-label">Offers</span>
+                      <span className="offer-stat-value">{filteredProducts.length}</span>
+                    </div>
+                    <div className="offer-stat-chip">
+                      <span className="offer-stat-label">Loaded</span>
+                      <span className="offer-stat-value">{loadedImageCount}/{filteredProducts.length || 0}</span>
+                    </div>
+                    <div className="offer-stat-chip">
+                      <span className="offer-stat-label">Selected</span>
+                      <span className="offer-stat-value">{Object.values(cart).reduce((sum, qty) => sum + qty, 0)}</span>
+                    </div>
+                    <div className="offer-stat-chip offer-stat-chip--price">
+                      <span className="offer-stat-label">Total</span>
+                      <span className="offer-stat-value">
+                        ₹{Math.round(
+                          Object.entries(cart).reduce((sum, [productId, qty]) => {
+                            const product = products.find(
+                              (p) => String(p.id) === String(productId),
+                            );
+                            return sum + (product ? Number(product.afterDiscount) * qty : 0);
+                          }, 0),
+                        )}
+                      </span>
+                    </div>
+                  </div>
 
-                <div
-                  className="grocery-row flex flex-wrap gap-1"
-                  style={{ marginBottom: "60px" }}
-                >
-                  {products
-                    .filter(
-                      (p) =>
-                        p.category?.toLowerCase() ===
-                          selectedCategory.toLowerCase() &&
-                        p.status === "Approved" &&
-                        Number(p.discount) > 0 &&
-                        (searchQuery === "" ||
-                          p.name
-                            ?.toLowerCase()
-                            .includes(searchQuery.toLowerCase())),
-                    )
-                    .map((product) => {
+                  {!searchQuery.trim() && visibleCount < filteredProducts.length && (
+                    <div className="offer-progress-hint">
+                      Showing {visibleProducts.length} of {filteredProducts.length} deals while more cards stream in...
+                    </div>
+                  )}
+
+                  <div
+                    className="grocery-row flex flex-wrap gap-1"
+                    style={{ marginBottom: "60px" }}
+                  >
+                    {imageLoading && !filteredProducts.length &&
+                      Array.from({ length: OFFER_SKELETON_COUNT }).map((_, index) => (
+                        <div key={`offer-skeleton-${index}`} className="offer-feed-card offer-feed-card--skeleton">
+                          <div className="offer-feed-skeleton offer-feed-skeleton--badge banner-shimmer-bar" />
+                          <div className="offer-feed-skeleton offer-feed-skeleton--image banner-shimmer-bar" />
+                          <div className="offer-feed-skeleton offer-feed-skeleton--line banner-shimmer-bar" />
+                          <div className="offer-feed-skeleton offer-feed-skeleton--line-short banner-shimmer-bar" />
+                          <div className="offer-feed-skeleton offer-feed-skeleton--price banner-shimmer-bar" />
+                          <div className="offer-feed-skeleton offer-feed-skeleton--cta banner-shimmer-bar" />
+                        </div>
+                      ))}
+
+                    {!imageLoading && !filteredProducts.length && (
+                      <div className="offer-empty-state">
+                        No offers matched your search right now.
+                      </div>
+                    )}
+
+                    {visibleProducts.map((product, index) => {
                       const stock = Number(product.stockLeft || 0);
                       const isOutOfStock = stock <= 0;
 
                       return (
                         <div
                           key={product.id}
-                          className="w-[200px] flex flex-col p-2 bg-white rounded shadow-sm border position-relative"
+                          className="offer-feed-card"
                           style={{
-                            minHeight: "230px",
+                            minHeight: "258px",
                             opacity: isOutOfStock ? 0.6 : 1,
+                            animationDelay: `${Math.min(index * 45, 280)}ms`,
                           }}
                         >
-                          <div className="d-flex flex-row justify-content-between absolute top-0 left-0 w-full">
+                          <div className="offer-feed-card-top">
                             {Number(product.discount) > 0 && !isOutOfStock && (
-                              <span className="discount-badge">
-                                {Math.round(Number(product.discount))}%
+                              <span className="offer-feed-discount-badge">
+                                {Math.round(Number(product.discount))}% OFF
                               </span>
                             )}
 
                             {!isOutOfStock && (
                               <span
-                                style={{
-                                  cursor: "pointer",
-                                  marginRight: "6px",
-                                  marginTop: "2px",
-                                  zIndex: 3,
-                                }}
+                                className="offer-feed-like"
                                 onClick={() => toggleLike(product.id)}
                               >
                                 {likedProducts[product.id] ? (
                                   <FavoriteIcon style={{ color: "red" }} />
                                 ) : (
-                                  <FavoriteBorderIcon
-                                    style={{ color: "grey" }}
-                                  />
+                                  <FavoriteBorderIcon style={{ color: "grey" }} />
                                 )}
                               </span>
                             )}
                           </div>
 
-                          {/* Product Image */}
-                          <div
-                            className="d-flex justify-content-center align-items-center position-relative"
-                            style={{ height: "90px" }}
-                          >
+                          <div className="offer-feed-image-wrap">
                             {!imageUrls[product.id]?.[0] ? (
-                                <div style={{
-                                  position: "relative",
-                                  width: "54px",
-                                  height: "54px",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                }}>
-                                  <div className="img-outer-ring" />
-                                  <div className="img-inner-ring" />
-                                  <div className="img-center-dot" />
-                                </div>
-                              ) : (   
+                              <div className="category-image-rocket-loader offer-feed-loader-shell">
+                                <div className="category-image-rocket-glow" />
+                                <div className="category-image-rocket-trail" />
+                                <div className="category-image-rocket-body" />
+                                <div className="category-image-rocket-window" />
+                                <div className="category-image-rocket-fin category-image-rocket-fin-left" />
+                                <div className="category-image-rocket-fin category-image-rocket-fin-right" />
+                                <div className="category-image-rocket-flame" />
+                                <div className="category-image-rocket-smoke category-image-rocket-smoke-one" />
+                                <div className="category-image-rocket-smoke category-image-rocket-smoke-two" />
+                              </div>
+                            ) : (
                               <img
                                 src={imageUrls[product.id][0]}
                                 alt={product.name}
+                                loading={index < 4 ? "eager" : "lazy"}
+                                fetchPriority={index < 2 ? "high" : "auto"}
+                                decoding="async"
+                                width="160"
+                                height="160"
+                                className="category-product-image is-visible offer-feed-image"
                                 style={{
-                                  maxHeight: "80px",
-                                  maxWidth: "100%",
-                                  objectFit: "contain",
-                                  cursor: isOutOfStock
-                                    ? "not-allowed"
-                                    : "pointer",
-                                  borderRadius: "6px",
+                                  cursor: isOutOfStock ? "not-allowed" : "pointer",
                                 }}
                                 onClick={() => {
                                   if (isOutOfStock) return;
                                   navigate(
-                                    `/groceryComboOffer/${userType}/${userId}/${product.id}`,   
+                                    `/groceryComboOffer/${userType}/${userId}/${product.id}`,
                                     {
                                       state: {
-                                        product,                              
-                                        imageUrl: imageUrls[product.id]?.[0] ?? null,  
+                                        product,
+                                        imageUrl: imageUrls[product.id]?.[0] ?? null,
                                       },
-                                    }
+                                    },
                                   );
                                 }}
                               />
-                           )}
+                            )}
 
                             {isOutOfStock && (
-                              <div
-                                className="position-absolute d-flex justify-content-center align-items-center"
-                                style={{
-                                  top: 0,
-                                  left: 0,
-                                  width: "100%",
-                                  height: "100%",
-                                  background: "rgba(255,255,255,0.75)",
-                                  borderRadius: "6px",
-                                  zIndex: 2,
-                                }}
-                              >
-                                <span
-                                  style={{
-                                    fontWeight: 500,
-                                    backgroundColor: "grey",
-                                    color: "white",
-                                    fontSize: "10px",
-                                    borderRadius: "6px",
-                                    margin: "1px",
-                                    padding: "2px",
-                                  }}
-                                >
-                                  Out of Stock
-                                </span>
+                              <div className="offer-feed-stock-mask">
+                                <span className="offer-feed-stock-pill">Out of Stock</span>
                               </div>
                             )}
                           </div>
 
-                          {/* Product Name */}   
-                          <h6
-                            className="text-start fw-bold m-0"
-                            style={{
-                              fontSize: "11px",
-                              display: "-webkit-box",
-                              WebkitLineClamp: 2,
-                              WebkitBoxOrient: "vertical",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              lineHeight: "1.2em",
-                              maxHeight: "3.6em",
-                            }}
-                          >
-                            {product.name}
-                          </h6>
+                          <h6 className="offer-feed-title">{product.name}</h6>
 
-                          {/* Price & Units & Max Limit (in stock only) */}
                           {!isOutOfStock && (
-                            <div
-                              className="text-start m-0"
-                              style={{ fontSize: "11px" }}
-                            >
-                              {product.afterDiscount != null && (
-                                <b className="text-success me-2">
-                                  ₹{Math.round(Number(product.afterDiscount))}
-                                </b>
-                              )}
-                              {product.mrp != null && (
-                                <s className="text-muted">₹{product.mrp}</s>
-                              )}
-                              {product.units && (
-                                <b
-                                  className="text-success"
-                                  style={{ marginLeft: "5px" }}
-                                >
-                                  {product.units}
-                                </b>
-                              )}
-                          {/* <p className="blinking-icon mb-0" style={{color: "#db1818", fontSize: "9px", fontWeight: "bold"}}>Click on the image to see more</p> */}
+                            <div className="offer-feed-meta">
+                              <div className="offer-feed-price-row">
+                                {product.afterDiscount != null && (
+                                  <b className="offer-feed-price-current">
+                                    ₹{Math.round(Number(product.afterDiscount))}
+                                  </b>
+                                )}
+                                {product.mrp != null && (
+                                  <s className="offer-feed-price-mrp">₹{product.mrp}</s>
+                                )}
+                                {product.units && (
+                                  <b className="offer-feed-units">{product.units}</b>
+                                )}
+                              </div>
 
                               {(() => {
                                 const limit = getLimit(product);
                                 return Number.isFinite(limit) && limit > 0 ? (
-                                  <div
-                                    style={{
-                                      color: "#db1818",
-                                      paddingBottom: "2px",
-                                      fontSize: "10px",
-                                      fontWeight: 600,
-                                      marginBottom: "28px",
-                                    }}
-                                  >
-                                    Max {limit} per customer
-                                  </div>
+                                  <div className="offer-feed-limit">Max {limit} per customer</div>
                                 ) : null;
                               })()}
                             </div>
                           )}
 
-                          {/* Checkbox */}
                           {!isOutOfStock && (
-                            <div
-                              style={{
-                                position: "absolute",
-                                bottom: "8px",
-                                left: "8px",
-                              }}
-                            >
-                              <input
-                                type="checkbox"
-                                className="border-dark"
-                                checked={cart[product.id] > 0}
-                                onChange={() => {
-                                  if (cart[product.id] > 0) {
-                                    handleDecrementClick(product.id);
-                                  } else {
-                                    handleAddClick(product.id);
-                                  }
+                            <div className="offer-feed-actions">
+                              <label className="offer-feed-check">
+                                <input
+                                  type="checkbox"
+                                  className="border-dark"
+                                  checked={cart[product.id] > 0}
+                                  onChange={() => {
+                                    if (cart[product.id] > 0) {
+                                      handleDecrementClick(product.id);
+                                    } else {
+                                      handleAddClick(product.id);
+                                    }
+                                  }}
+                                />
+                                <span>Select</span>
+                              </label>
+
+                              <button
+                                className="offer-feed-add-btn"
+                                onClick={() => {
+                                  handleAddClick(product.id);
+                                  navigate(`/groceryComboOffer/${userType}/${userId}/${product.id}`, {
+                                    state: {
+                                      product,
+                                      imageUrl: imageUrls[product.id]?.[0] ?? null,
+                                    },
+                                  });
                                 }}
-                              />   
+                              >
+                                ADD
+                              </button>
                             </div>
                           )}
-
-                       {/* Add / Counter */}
-                        {!isOutOfStock && (
-                          <div
-                            style={{
-                              position: "absolute",
-                              bottom: "8px",
-                              right: "8px",
-                            }}
-                          >
-                            <button
-                              className="btn fw-bold"
-                              style={{
-                                border: "1px solid green",
-                                color: "white",
-                                backgroundColor: "green",
-                                borderRadius: "8px",
-                                padding: "2px 8px",
-                                fontSize: "11px",
-                              }}
-                              onClick={() => {
-                                handleAddClick(product.id);
-                                navigate(`/groceryComboOffer/${userType}/${userId}/${product.id}`, {
-                                  state: {
-                                    product,
-                                    imageUrl: imageUrls[product.id]?.[0] ?? null,
-                                  },
-                                });
-                              }}
-                            >
-                              ADD
-                            </button>
-                          </div>
-                        )}
                         </div>
                       );
                     })}
+                  </div>
 
                   {/* Cart Bar */}
                   {/* {(() => {

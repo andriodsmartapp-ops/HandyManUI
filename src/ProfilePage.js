@@ -20,6 +20,7 @@ import LocalOfferIcon from '@mui/icons-material/LocalOffer';
 import ApartmentIcon from '@mui/icons-material/Apartment';
 import ConfirmationNumberIcon from '@mui/icons-material/ConfirmationNumber';
 import MenuIcon from '@mui/icons-material/Menu';
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
 import Electrical from './img/Electrical.jpeg';
 import Electronics from './img/Electronics.jpeg';  
 import Plumbing from './img/Plumbing.jpeg';
@@ -65,6 +66,18 @@ import RoyalImg from './img/LMartLogo.jpeg';
 import HomeElectricalImg from './img/HomeElectrical.jpeg';
 import HomePlumbingImg from './img/HomePlumbing.jpeg'; 
 import OffersBannerModal from './OffersBannerModal.js';
+import {
+  appendHelpRequestMessage,
+  fetchActiveUserSummary,
+  fetchHelpRequests,
+  fetchProfileMessages,
+  getNotificationState,
+  registerInstallActivity,
+  requestNotificationPermission,
+  submitHelpRequest,
+  trackLoginActivity,
+  trackUserActivity,
+} from "./utils/auth";
 // import { appConfig } from "./config";                     
 
 const getMenuList = (userType, userId, category, district ,ZipCode,technicianFullName, isMobile) => {
@@ -138,6 +151,80 @@ const collectionsCategories = [
 
   const IMAGE_API =
   `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=`;
+
+const formatActivityDuration = (seconds) => {
+  const totalSeconds = Number(seconds || 0);
+  if (!totalSeconds) {
+    return "0 min";
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.max(1, Math.round((totalSeconds % 3600) / 60));
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+
+  return `${minutes} min`;
+};
+
+const formatRelativeActivity = (value) => {
+  if (!value) {
+    return "Not tracked yet";
+  }
+
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    return "Not tracked yet";
+  }
+
+  const diffMinutes = Math.max(0, Math.round((Date.now() - timestamp.getTime()) / 60000));
+  if (diffMinutes < 1) {
+    return "Just now";
+  }
+  if (diffMinutes < 60) {
+    return `${diffMinutes} min ago`;
+  }
+
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) {
+    return `${diffHours} hr ago`;
+  }
+
+  return timestamp.toLocaleString();
+};
+
+const formatHelpTopicLabel = (topic) =>
+  (topic || "other")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (match) => match.toUpperCase()) || "Other";
+
+const getHelpReplyMarker = (request) => {
+  if (!request?.id) {
+    return "";
+  }
+
+  return [request.id, request.repliedAt || request.updatedAt || "", request.adminReply || ""]
+    .filter(Boolean)
+    .join("::");
+};
+
+const sortHelpRequestsByLatest = (requests = []) =>
+  [...requests].sort((left, right) => {
+    const leftTime = new Date(left?.updatedAt || left?.latestMessageAt || left?.createdAt || 0).getTime();
+    const rightTime = new Date(right?.updatedAt || right?.latestMessageAt || right?.createdAt || 0).getTime();
+    return rightTime - leftTime;
+  });
+
+const readBlobAsDataUrl = (blob) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Unable to read the recorded voice note."));
+    reader.readAsDataURL(blob);
+  });
 
 const ProfilePage = () => {
    const [allProducts, setAllProducts] = useState([]);
@@ -225,6 +312,88 @@ const [walletAmount, setWalletAmount] = useState("0");
 const [walletLoading, setWalletLoading] = useState(true);
 const [showWalletMessage, setShowWalletMessage] = useState(false);
 const [showWelcomeMessage, setShowWelcomeMessage] = useState(false);
+const [showPushPromptModal, setShowPushPromptModal] = useState(false);
+const [notificationPermission, setNotificationPermission] = useState(
+  () => getNotificationState().permissionGranted
+);
+const [isEnablingNotifications, setIsEnablingNotifications] = useState(false);
+const [profileMessages, setProfileMessages] = useState([]);
+const [helpRequests, setHelpRequests] = useState([]);
+const [showHelpBoardModal, setShowHelpBoardModal] = useState(false);
+const [activeHelpRequestId, setActiveHelpRequestId] = useState("");
+const [helpRequestTopic, setHelpRequestTopic] = useState("delivery");
+const [helpRequestMessage, setHelpRequestMessage] = useState("");
+const [helpRequestError, setHelpRequestError] = useState("");
+const [helpRequestSuccess, setHelpRequestSuccess] = useState("");
+const [helpVoiceDraft, setHelpVoiceDraft] = useState(null);
+const [helpVoiceError, setHelpVoiceError] = useState("");
+const [isRecordingHelpVoice, setIsRecordingHelpVoice] = useState(false);
+const [submittingHelpRequest, setSubmittingHelpRequest] = useState(false);
+const [profileInsightsLoading, setProfileInsightsLoading] = useState(true);
+const [userActivitySummary, setUserActivitySummary] = useState(null);
+const [latestHelpReply, setLatestHelpReply] = useState(null);
+const sessionStartedAtRef = useRef(Date.now());
+const sessionIdRef = useRef(`profile-${userId || "guest"}-${Date.now()}`);
+const hasTrackedSessionRef = useRef(false);
+const lastSeenHelpReplyRef = useRef("");
+const helpRecorderRef = useRef(null);
+const helpRecorderStreamRef = useRef(null);
+const helpRecorderChunksRef = useRef([]);
+const helpRecordingStartedAtRef = useRef(0);
+const helpMessagesEndRef = useRef(null);
+const canRecordHelpVoice =
+  typeof window !== "undefined" &&
+  typeof window.MediaRecorder !== "undefined" &&
+  typeof navigator !== "undefined" &&
+  Boolean(navigator.mediaDevices?.getUserMedia);
+const helpConversations = sortHelpRequestsByLatest(helpRequests);
+const activeHelpRequest =
+  helpConversations.find((request) => request.id === activeHelpRequestId) || helpConversations[0] || null;
+const activeHelpMessages = Array.isArray(activeHelpRequest?.messages) ? activeHelpRequest.messages : [];
+
+const toCachedImageUrl = (filename, base64) => {
+  if (!base64 || !filename) return "";
+  return ImageCache.getOrCreateObjectUrl(filename, base64);
+};
+
+const getProductImageSrc = useCallback(
+  (productId) => {
+    const imageEntry = cartImages[productId] || imageUrls[productId];
+    if (Array.isArray(imageEntry)) {
+      return imageEntry[0] || "";
+    }
+    return imageEntry || "";
+  },
+  [cartImages, imageUrls]
+);
+
+const renderImagePlaceholder = (label) => (
+  <div
+    className="d-flex flex-column justify-content-center align-items-center w-100 h-100"
+    style={{
+      minHeight: "80px",
+      borderRadius: "10px",
+      background: "linear-gradient(135deg, #f6f7f9 0%, #eceff3 100%)",
+      border: "1px solid #edf0f4",
+      padding: "10px",
+      textAlign: "center",
+    }}
+  >
+    <div
+      style={{
+        width: "70%",
+        height: "44px",
+        borderRadius: "8px",
+        backgroundColor: "#dde3ea",
+        marginBottom: "8px",
+      }}
+    />
+    <span className="text-muted" style={{ fontSize: "10px", fontWeight: 500 }}>
+      {label}
+    </span>
+  </div>
+);
+
 useEffect(() => {
   console.log(windowSize, state, address, mobileNumber,id, pinCode, paidAmount, paymentMode, martId,status, imageLoading, zoomProduct, zoomImage, showZoomModal, cartSummary, items, grocery,error, showMenu, products, selectedCategory, dress);
 }, [windowSize, state, address, mobileNumber, id, pinCode, paidAmount, paymentMode, martId, status, imageLoading, zoomProduct, zoomImage, showZoomModal, cartSummary, items, grocery, error,showMenu, products, selectedCategory, dress]);
@@ -246,6 +415,584 @@ useEffect(() => {
     return () => clearTimeout(timer);
   }
 }, [profile.fullName]);
+
+const refreshProfileInsights = useCallback(async () => {
+  const resolvedMobileNumber = profile.mobileNumber || mobileNumber;
+
+  if (!userId && !resolvedMobileNumber) {
+    setUserActivitySummary(null);
+    setProfileMessages([]);
+    setHelpRequests([]);
+    setProfileInsightsLoading(false);
+    return;
+  }
+
+  setProfileInsightsLoading(true);
+  try {
+    const [summary, messages, requests] = await Promise.all([
+      fetchActiveUserSummary({
+        userId,
+        mobileNumber: resolvedMobileNumber,
+      }),
+      fetchProfileMessages({
+        userId,
+        mobileNumber: resolvedMobileNumber,
+      }),
+      fetchHelpRequests({
+        userId,
+        mobileNumber: resolvedMobileNumber,
+      }),
+    ]);
+    setUserActivitySummary(summary);
+    setProfileMessages(Array.isArray(messages) ? messages : []);
+    setHelpRequests(Array.isArray(requests) ? requests : []);
+  } catch (error) {
+    console.error("Failed to refresh profile activity insights", error);
+  } finally {
+    setProfileInsightsLoading(false);
+  }
+}, [mobileNumber, profile.mobileNumber, userId]);
+
+const sendActivityEvent = useCallback((eventType, extra = {}) => {
+  const resolvedMobileNumber = profile.mobileNumber || mobileNumber;
+
+  if (!userId && !resolvedMobileNumber) {
+    return Promise.resolve(null);
+  }
+
+  return trackUserActivity({
+    userId,
+    mobileNumber: resolvedMobileNumber,
+    name: profile.fullName,
+    fullName: profile.fullName,
+    location: profile.district || district,
+    sessionId: sessionIdRef.current,
+    page: "profile-page",
+    path: typeof window !== "undefined" ? window.location.pathname : "/profile",
+    ...extra,
+    eventType,
+  });
+}, [district, mobileNumber, profile.district, profile.fullName, profile.mobileNumber, userId]);
+
+const handleOpenPushPrompt = useCallback(() => {
+  const currentNotificationState = getNotificationState();
+  setNotificationPermission(currentNotificationState.permissionGranted);
+  setShowPushPromptModal(true);
+}, []);
+
+const handleEnableNotifications = useCallback(async () => {
+  const currentNotificationState = getNotificationState();
+  setNotificationPermission(currentNotificationState.permissionGranted);
+
+  if (currentNotificationState.permissionGranted === "unsupported") {
+    setShowPushPromptModal(true);
+    return;
+  }
+
+  if (currentNotificationState.permissionGranted === "granted") {
+    setShowPushPromptModal(false);
+    await refreshProfileInsights();
+    return;
+  }
+
+  setIsEnablingNotifications(true);
+  try {
+    const permission = await requestNotificationPermission({
+      userId,
+      mobileNumber: profile.mobileNumber || mobileNumber,
+      name: profile.fullName,
+      fullName: profile.fullName,
+      location: profile.district || district,
+    });
+
+    setNotificationPermission(permission);
+    if (permission === "granted") {
+      setShowPushPromptModal(false);
+      await sendActivityEvent("notification-enabled", {
+        action: "notifications_enabled",
+      });
+    } else {
+      setShowPushPromptModal(true);
+    }
+    await refreshProfileInsights();
+  } catch (error) {
+    console.error("Failed to request notification permission", error);
+  } finally {
+    setIsEnablingNotifications(false);
+  }
+}, [district, mobileNumber, profile.district, profile.fullName, profile.mobileNumber, refreshProfileInsights, sendActivityEvent, userId]);
+
+const handleProfileMessageAction = useCallback((message) => {
+  sendActivityEvent("profile-message-opened", {
+    action: "profile_message_opened",
+    metadata: {
+      messageId: message?.id,
+      title: message?.title,
+    },
+  });
+
+  if (!message?.ctaUrl) {
+    return;
+  }
+
+  if (/^https?:\/\//i.test(message.ctaUrl)) {
+    window.location.href = message.ctaUrl;
+    return;
+  }
+
+  navigate(message.ctaUrl);
+}, [navigate, sendActivityEvent]);
+
+const stopHelpRecorderStream = useCallback(() => {
+  if (helpRecorderStreamRef.current) {
+    helpRecorderStreamRef.current.getTracks().forEach((track) => track.stop());
+    helpRecorderStreamRef.current = null;
+  }
+  helpRecorderRef.current = null;
+}, []);
+
+const markHelpReplySeen = useCallback(
+  (request) => {
+    const replyMarker = getHelpReplyMarker(request);
+    const storageKey = `hm_last_seen_help_reply_${userId || profile.mobileNumber || mobileNumber || "guest"}`;
+
+    if (replyMarker && typeof window !== "undefined") {
+      localStorage.setItem(storageKey, replyMarker);
+      lastSeenHelpReplyRef.current = replyMarker;
+    }
+  },
+  [mobileNumber, profile.mobileNumber, userId]
+);
+
+const resetHelpComposer = useCallback(() => {
+  setHelpRequestMessage("");
+  setHelpVoiceDraft(null);
+  setHelpVoiceError("");
+}, []);
+
+const handleOpenHelpBoard = useCallback(
+  (requestId = "") => {
+    const nextRequestId = requestId || helpConversations[0]?.id || "";
+    const selectedRequest = helpConversations.find((request) => request.id === nextRequestId) || helpConversations[0] || null;
+
+    setActiveHelpRequestId(nextRequestId);
+    setHelpRequestError("");
+    setHelpRequestSuccess("");
+    setHelpVoiceError("");
+    setShowHelpBoardModal(true);
+
+    if (selectedRequest?.adminReply) {
+      setLatestHelpReply(selectedRequest);
+      markHelpReplySeen(selectedRequest);
+    }
+
+    sendActivityEvent("help-board-opened", {
+      action: "help_board_opened",
+      metadata: {
+        requestId: nextRequestId || undefined,
+      },
+    });
+  },
+  [helpConversations, markHelpReplySeen, sendActivityEvent]
+);
+
+const handleStartNewHelpThread = useCallback(() => {
+  setActiveHelpRequestId("");
+  setHelpRequestTopic("delivery");
+  setHelpRequestError("");
+  setHelpRequestSuccess("");
+  setHelpVoiceError("");
+  resetHelpComposer();
+  setShowHelpBoardModal(true);
+}, [resetHelpComposer]);
+
+const handleCloseHelpBoard = useCallback(() => {
+  if (helpRecorderRef.current && helpRecorderRef.current.state !== "inactive") {
+    helpRecorderChunksRef.current = [];
+    helpRecorderRef.current.stop();
+  } else {
+    stopHelpRecorderStream();
+  }
+
+  if (activeHelpRequest?.adminReply) {
+    markHelpReplySeen(activeHelpRequest);
+  }
+
+  setIsRecordingHelpVoice(false);
+  setHelpRequestError("");
+  setHelpVoiceError("");
+  setShowHelpBoardModal(false);
+}, [activeHelpRequest, markHelpReplySeen, stopHelpRecorderStream]);
+
+const startHelpVoiceRecording = useCallback(async () => {
+  if (!canRecordHelpVoice) {
+    setHelpVoiceError("Voice messages are not supported in this browser.");
+    return;
+  }
+
+  setHelpVoiceError("");
+  setHelpRequestError("");
+  setHelpRequestSuccess("");
+  setHelpVoiceDraft(null);
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const preferredMimeTypes = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg", "audio/mp4"];
+    const mimeType = preferredMimeTypes.find((candidate) =>
+      typeof window.MediaRecorder.isTypeSupported === "function"
+        ? window.MediaRecorder.isTypeSupported(candidate)
+        : false
+    );
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+    helpRecorderStreamRef.current = stream;
+    helpRecorderRef.current = recorder;
+    helpRecorderChunksRef.current = [];
+    helpRecordingStartedAtRef.current = Date.now();
+
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        helpRecorderChunksRef.current.push(event.data);
+      }
+    };
+
+    recorder.onstop = async () => {
+      const chunks = helpRecorderChunksRef.current;
+      helpRecorderChunksRef.current = [];
+      setIsRecordingHelpVoice(false);
+
+      const voiceBlob = chunks.length
+        ? new Blob(chunks, { type: recorder.mimeType || "audio/webm" })
+        : null;
+
+      stopHelpRecorderStream();
+
+      if (!voiceBlob || voiceBlob.size === 0) {
+        return;
+      }
+
+      try {
+        const dataUrl = await readBlobAsDataUrl(voiceBlob);
+        setHelpVoiceDraft({
+          dataUrl,
+          mimeType: voiceBlob.type || recorder.mimeType || "audio/webm",
+          fileName: `help-voice-${Date.now()}.webm`,
+          durationSeconds: Math.max(1, Math.round((Date.now() - helpRecordingStartedAtRef.current) / 1000)),
+          sizeBytes: voiceBlob.size,
+        });
+      } catch (error) {
+        console.error("Failed to prepare voice note", error);
+        setHelpVoiceError("We recorded your voice note, but could not prepare it for sending.");
+      }
+    };
+
+    recorder.onerror = () => {
+      setIsRecordingHelpVoice(false);
+      stopHelpRecorderStream();
+      setHelpVoiceError("Unable to record a voice message right now.");
+    };
+
+    recorder.start();
+    setIsRecordingHelpVoice(true);
+  } catch (error) {
+    console.error("Failed to start voice recording", error);
+    stopHelpRecorderStream();
+    setIsRecordingHelpVoice(false);
+    setHelpVoiceError("Please allow microphone access to record a voice message.");
+  }
+}, [canRecordHelpVoice, stopHelpRecorderStream]);
+
+const stopHelpVoiceRecording = useCallback(() => {
+  if (!helpRecorderRef.current) {
+    return;
+  }
+
+  if (helpRecorderRef.current.state !== "inactive") {
+    helpRecorderRef.current.stop();
+  }
+}, []);
+
+const clearHelpVoiceDraft = useCallback(() => {
+  setHelpVoiceDraft(null);
+  setHelpVoiceError("");
+}, []);
+
+const handleSubmitHelpRequest = useCallback(async () => {
+  const resolvedMobileNumber = profile.mobileNumber || mobileNumber;
+  const trimmedMessage = helpRequestMessage.trim();
+
+  if (isRecordingHelpVoice) {
+    setHelpRequestError("Stop the voice recording before sending your message.");
+    return;
+  }
+
+  if (!trimmedMessage && !helpVoiceDraft) {
+    setHelpRequestError("Type a message or record a voice note for the admin team.");
+    return;
+  }
+
+  setSubmittingHelpRequest(true);
+  setHelpRequestError("");
+  setHelpRequestSuccess("");
+  setHelpVoiceError("");
+
+  try {
+    let responsePayload = null;
+
+    if (activeHelpRequest?.id) {
+      responsePayload = await appendHelpRequestMessage({
+        requestId: activeHelpRequest.id,
+        userId,
+        mobileNumber: resolvedMobileNumber,
+        name: profile.fullName,
+        fullName: profile.fullName,
+        location: profile.district || district,
+        topic: activeHelpRequest.topic,
+        title: activeHelpRequest.title,
+        message: trimmedMessage,
+        voiceNote: helpVoiceDraft,
+        sentBy: profile.fullName || "User",
+        metadata: {
+          page: "profile-page",
+        },
+        messageMetadata: {
+          page: "profile-page",
+          hasVoiceNote: Boolean(helpVoiceDraft),
+        },
+      });
+
+      await sendActivityEvent("help-request-message-sent", {
+        action: "help_request_message_sent",
+        metadata: {
+          topic: activeHelpRequest.topic,
+          requestId: activeHelpRequest.id,
+          hasVoiceNote: Boolean(helpVoiceDraft),
+        },
+      });
+
+      setHelpRequestSuccess("Your message was added to the chat.");
+    } else {
+      responsePayload = await submitHelpRequest({
+        userId,
+        mobileNumber: resolvedMobileNumber,
+        name: profile.fullName,
+        fullName: profile.fullName,
+        location: profile.district || district,
+        topic: helpRequestTopic,
+        title: `${helpRequestTopic.replace(/-/g, " ")} help request`,
+        message: trimmedMessage,
+        voiceNote: helpVoiceDraft,
+        metadata: {
+          page: "profile-page",
+        },
+        messageMetadata: {
+          page: "profile-page",
+          hasVoiceNote: Boolean(helpVoiceDraft),
+        },
+      });
+
+      await sendActivityEvent("help-request-submitted", {
+        action: "help_request_submitted",
+        metadata: {
+          topic: helpRequestTopic,
+          hasVoiceNote: Boolean(helpVoiceDraft),
+        },
+      });
+
+      setHelpRequestSuccess("Your question has been sent to the admin team.");
+    }
+
+    resetHelpComposer();
+    const nextRequestId = responsePayload?.item?.id || activeHelpRequest?.id || "";
+    if (nextRequestId) {
+      setActiveHelpRequestId(nextRequestId);
+    }
+    await refreshProfileInsights();
+  } catch (error) {
+    console.error("Failed to submit help request", error);
+    setHelpRequestError(error?.message || "Unable to submit your request right now.");
+  } finally {
+    setSubmittingHelpRequest(false);
+  }
+}, [
+  activeHelpRequest,
+  district,
+  helpRequestMessage,
+  helpRequestTopic,
+  helpVoiceDraft,
+  isRecordingHelpVoice,
+  mobileNumber,
+  profile.district,
+  profile.fullName,
+  profile.mobileNumber,
+  refreshProfileInsights,
+  resetHelpComposer,
+  sendActivityEvent,
+  userId,
+]);
+
+useEffect(() => {
+  sessionStartedAtRef.current = Date.now();
+  sessionIdRef.current = `profile-${userId || "guest"}-${Date.now()}`;
+  hasTrackedSessionRef.current = false;
+}, [userId]);
+
+useEffect(() => {
+  const resolvedMobileNumber = profile.mobileNumber || mobileNumber;
+
+  if (!userId || hasTrackedSessionRef.current || (!profile.fullName && !resolvedMobileNumber)) {
+    return undefined;
+  }
+
+  hasTrackedSessionRef.current = true;
+  const currentNotificationState = getNotificationState();
+  setNotificationPermission(currentNotificationState.permissionGranted);
+  setShowPushPromptModal(currentNotificationState.permissionGranted === "default");
+
+  const identity = {
+    userId,
+    mobileNumber: resolvedMobileNumber,
+    name: profile.fullName,
+    fullName: profile.fullName,
+    location: profile.district || district,
+    source: {
+      page: "profile-page",
+      startedAt: new Date().toISOString(),
+    },
+  };
+
+  trackLoginActivity(identity);
+  registerInstallActivity(identity);
+  sendActivityEvent("profile-opened", {
+    action: "profile_opened",
+  });
+  refreshProfileInsights();
+
+  const heartbeat = setInterval(() => {
+    const elapsedSeconds = Math.max(
+      1,
+      Math.round((Date.now() - sessionStartedAtRef.current) / 1000)
+    );
+
+    sendActivityEvent("heartbeat", {
+      action: "profile_heartbeat",
+      durationSeconds: elapsedSeconds,
+      activeSeconds: elapsedSeconds,
+      metadata: {
+        notificationPermission: getNotificationState().permissionGranted,
+      },
+    });
+    refreshProfileInsights();
+  }, 60000);
+
+  return () => {
+    clearInterval(heartbeat);
+    const elapsedSeconds = Math.max(
+      1,
+      Math.round((Date.now() - sessionStartedAtRef.current) / 1000)
+    );
+    sendActivityEvent("session-ended", {
+      action: "profile_session_closed",
+      durationSeconds: elapsedSeconds,
+      activeSeconds: elapsedSeconds,
+    });
+  };
+}, [district, mobileNumber, profile.district, profile.fullName, profile.mobileNumber, refreshProfileInsights, sendActivityEvent, userId]);
+
+useEffect(() => {
+  if (!helpRequests.length) {
+    setActiveHelpRequestId("");
+    return;
+  }
+
+  setActiveHelpRequestId((currentRequestId) => {
+    if (currentRequestId && helpRequests.some((request) => request.id === currentRequestId)) {
+      return currentRequestId;
+    }
+
+    return sortHelpRequestsByLatest(helpRequests)[0]?.id || "";
+  });
+}, [helpRequests]);
+
+useEffect(() => {
+  const latestRepliedRequest = sortHelpRequestsByLatest(helpRequests).find((request) => request?.adminReply) || null;
+
+  if (!latestRepliedRequest) {
+    setLatestHelpReply(null);
+    return;
+  }
+
+  const replyMarker = getHelpReplyMarker(latestRepliedRequest);
+  const storageKey = `hm_last_seen_help_reply_${userId || profile.mobileNumber || mobileNumber || "guest"}`;
+  const savedMarker = typeof window !== "undefined" ? localStorage.getItem(storageKey) || "" : "";
+
+  lastSeenHelpReplyRef.current = savedMarker;
+  setLatestHelpReply(latestRepliedRequest);
+
+  if (replyMarker && replyMarker !== savedMarker) {
+    setActiveHelpRequestId(latestRepliedRequest.id);
+    setShowHelpBoardModal(true);
+    markHelpReplySeen(latestRepliedRequest);
+  }
+}, [helpRequests, markHelpReplySeen, mobileNumber, profile.mobileNumber, userId]);
+
+useEffect(() => {
+  if (!showHelpBoardModal) {
+    return;
+  }
+
+  if (activeHelpRequest?.adminReply) {
+    markHelpReplySeen(activeHelpRequest);
+  }
+
+  if (helpMessagesEndRef.current) {
+    helpMessagesEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+  }
+}, [activeHelpMessages.length, activeHelpRequest, markHelpReplySeen, showHelpBoardModal]);
+
+useEffect(() => () => {
+  stopHelpRecorderStream();
+}, [stopHelpRecorderStream]);
+
+useEffect(() => {
+  const trimmedQuery = searchQuery.trim();
+  if (!trimmedQuery) {
+    return undefined;
+  }
+
+  const timer = setTimeout(() => {
+    sendActivityEvent("search", {
+      action: "search",
+      metadata: {
+        query: trimmedQuery.slice(0, 60),
+      },
+    });
+  }, 900);
+
+  return () => clearTimeout(timer);
+}, [searchQuery, sendActivityEvent]);
+
+useEffect(() => {
+  if (!selectedCategory) {
+    return;
+  }
+
+  const selectedLabel =
+    typeof selectedCategory === "object"
+      ? selectedCategory.label || selectedCategory.value || ""
+      : String(selectedCategory || "");
+
+  if (!selectedLabel) {
+    return;
+  }
+
+  sendActivityEvent("category-selected", {
+    action: "category_selected",
+    metadata: {
+      category: selectedLabel,
+    },
+  });
+}, [selectedCategory, sendActivityEvent]);
 
 useEffect(() => {
   const onResize = () => {
@@ -315,14 +1062,14 @@ useEffect(() => {
         }))
         .filter((x) => !!x.photo);
       const cachedMap = {};
-      const misses = [];    
+      const misses = [];
       for (const { productId, photo } of firstImages) {
-        const cached = ImageCache.getBase64(photo);
+        const cached = await ImageCache.getBase64(photo);
         if (cached) {
-          cachedMap[productId] = [`data:image/jpeg;base64,${cached}`];
+          cachedMap[productId] = toCachedImageUrl(photo, cached);
         } else {
           misses.push({ productId, photo });
-        }    
+        }
       }
       if (Object.keys(cachedMap).length) {
         setImageUrls((prev) => ({ ...prev, ...cachedMap }));
@@ -331,7 +1078,7 @@ useEffect(() => {
       const fetchOne = async ({ productId, photo }) => {
         try {
           const res = await fetch(
-            `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=${photo}`,
+            `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=${encodeURIComponent(photo)}`,
             { signal }
           );
 
@@ -339,13 +1086,13 @@ useEffect(() => {
           const b64 = json?.imageData || "";
           if (!b64) return;
 
-          ImageCache.setBase64(photo, b64);
-          const dataUrl = `data:image/jpeg;base64,${b64}`;
+          await ImageCache.setBase64(photo, b64);
+          const objectUrl = toCachedImageUrl(photo, b64);
 
           if (!cancelled) {
             setImageUrls((prev) => {
-              if (prev[productId]?.[0] === dataUrl) return prev;
-              return { ...prev, [productId]: [dataUrl] };
+              if (prev[productId] === objectUrl) return prev;
+              return { ...prev, [productId]: objectUrl };
             });
           }
         } catch {}
@@ -391,7 +1138,7 @@ useEffect(() => {
         if (json?.imageData) {
           setCartImages(prev => ({
             ...prev,
-            [p.id]: `data:image/jpeg;base64,${json.imageData}`,
+            [p.id]: toCachedImageUrl(p.imageFile, json.imageData),
           }));
         }
       } catch (err) {
@@ -416,7 +1163,7 @@ useEffect(() => {
         if (json?.imageData) {
           setCartImages(prev => ({
             ...prev,
-            [item.id]: `data:image/jpeg;base64,${json.imageData}`,
+            [item.id]: toCachedImageUrl(item.imageFile, json.imageData),
           }));
         }
       } catch (e) {
@@ -539,22 +1286,51 @@ useEffect(() => {
   useEffect(() => {
     if (!filteredProducts.length) return;
     const controller = new AbortController();
-    filteredProducts.forEach(async (p) => {
-      if (!p.images?.[0] || imageUrls[p.id]) return;
-      try {
-        const res = await fetch(
-          `${IMAGE_API}${encodeURIComponent(p.images[0])}`,
-          { signal: controller.signal }
-        );
-        const json = await res.json();
-        if (!json?.imageData) return;
-        setImageUrls((prev) => ({
-          ...prev,
-          [p.id]: `data:image/jpeg;base64,${json.imageData}`,
-        }));
-      } catch {}
-    });
-    return () => controller.abort();
+    let cancelled = false;
+
+    const hydrateFilteredImages = async () => {
+      await Promise.allSettled(
+        filteredProducts.map(async (p) => {
+          const photo = p.images?.[0];
+          if (!photo || imageUrls[p.id]) return;
+
+          const cached = await ImageCache.getBase64(photo);
+          if (cached) {
+            if (!cancelled) {
+              const objectUrl = toCachedImageUrl(photo, cached);
+              setImageUrls((prev) => (prev[p.id] === objectUrl ? prev : {
+                ...prev,
+                [p.id]: objectUrl,
+              }));
+            }
+            return;
+          }
+
+          try {
+            const res = await fetch(
+              `${IMAGE_API}${encodeURIComponent(photo)}`,
+              { signal: controller.signal }
+            );
+            const json = await res.json();
+            const b64 = json?.imageData || "";
+            if (!b64 || cancelled) return;
+
+            await ImageCache.setBase64(photo, b64);
+            const objectUrl = toCachedImageUrl(photo, b64);
+            setImageUrls((prev) => (prev[p.id] === objectUrl ? prev : {
+              ...prev,
+              [p.id]: objectUrl,
+            }));
+          } catch {}
+        })
+      );
+    };
+
+    hydrateFilteredImages();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [filteredProducts, imageUrls]);
 
 const handleAddClick = (product) => {
@@ -1121,10 +1897,10 @@ const fetchImageUrl = async (photoId) => {
   try { 
     if (!photoId) return;
     const response = await axios.get(
-      `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=${photoId}`
+      `https://lmartapiv1-fxcyd2b4btacgsav.westus2-01.azurewebsites.net/api/FileUpload/download?generatedfilename=${encodeURIComponent(photoId)}`
     );
     if (response.status === 200 && response.data.imageData) {
-      const imageUrl = `data:image/jpeg;base64,${response.data.imageData}`;
+      const imageUrl = toCachedImageUrl(photoId, response.data.imageData);
       setProfileImage(imageUrl);
     }
   } catch (error) {
@@ -1234,7 +2010,7 @@ const filteredGroceryData = groceryData.filter((t) =>
     </div>
         <div className="hdr_icns d-flex align-items-center ">
       <div id="dropdown-container" className="dropdown-container" style={{ position: "relative" }}>
-        <div className="d-flex align-items-center">
+        <div className="d-flex align-items-center gap-2">
          {/* Customer Care Number */}
           <div
                 className="d-flex align-items-start"
@@ -1534,6 +2310,271 @@ const filteredGroceryData = groceryData.filter((t) =>
       disabled={!selectedOption}
     >
       Continue
+    </Button>
+  </Modal.Footer>
+</Modal>
+
+<Modal
+  show={showPushPromptModal}
+  onHide={() => setShowPushPromptModal(false)}
+  centered
+  className="profile-push-modal"
+>
+  <Modal.Header closeButton>
+    <Modal.Title>Stay updated instantly</Modal.Title>
+  </Modal.Header>
+  <Modal.Body>
+    <div className="profile-push-modal__icon" aria-hidden="true">🔔</div>
+    <h5 className="profile-push-modal__heading">Turn on HandyMan notifications</h5>
+    <p className="profile-push-modal__copy">
+      Get admin offers, order updates, and profile alerts without needing to refresh the page.
+    </p>
+    <div className="profile-push-modal__status-row">
+      <span className="text-muted small">Browser status</span>
+      <span className={`badge ${notificationPermission === "granted" ? "bg-success" : notificationPermission === "denied" ? "bg-danger" : notificationPermission === "unsupported" ? "bg-secondary" : "bg-warning text-dark"}`}>
+        {notificationPermission}
+      </span>
+    </div>
+    {notificationPermission === "denied" && (
+      <div className="profile-push-modal__hint">
+        Notifications are blocked in the browser. Allow them in site settings, then try again.
+      </div>
+    )}
+    {notificationPermission === "unsupported" && (
+      <div className="profile-push-modal__hint">
+        This browser does not support push notifications yet.
+      </div>
+    )}
+  </Modal.Body>
+  <Modal.Footer>
+    <Button variant="outline-secondary" onClick={() => setShowPushPromptModal(false)}>
+      Maybe later
+    </Button>
+    <Button
+      variant="success"
+      onClick={handleEnableNotifications}
+      disabled={isEnablingNotifications || notificationPermission === "unsupported"}
+    >
+      {notificationPermission === "granted"
+        ? "Enabled"
+        : isEnablingNotifications
+          ? "Enabling..."
+          : notificationPermission === "denied"
+            ? "Try again"
+            : "Enable notifications"}
+    </Button>
+  </Modal.Footer>
+</Modal>
+
+<Modal
+  show={showHelpBoardModal}
+  onHide={handleCloseHelpBoard}
+  centered
+  scrollable
+  size="lg"
+  className="profile-help-modal"
+>
+  <Modal.Header closeButton>
+    <Modal.Title>Help assistant chat</Modal.Title>
+  </Modal.Header>
+  <Modal.Body>
+    <p className="text-muted small mb-3">
+      Ask about delivery, placing orders, offers, or anything else. This chat stays in one thread for you and the admin team.
+    </p>
+
+    {helpRequestError && (
+      <div className="alert alert-danger py-2" role="alert">
+        {helpRequestError}
+      </div>
+    )}
+
+    {helpVoiceError && (
+      <div className="alert alert-warning py-2" role="alert">
+        {helpVoiceError}
+      </div>
+    )}
+
+    {helpRequestSuccess && (
+      <div className="alert alert-success py-2" role="alert">
+        {helpRequestSuccess}
+      </div>
+    )}
+
+    <div className="profile-help-shell">
+      <div className="profile-help-conversations">
+        <div className="profile-help-conversations__header">
+          <div>
+            <h6 className="mb-1">Your chats</h6>
+            <div className="small text-muted">
+              {profileInsightsLoading ? "Refreshing conversations..." : `${helpConversations.length} thread${helpConversations.length === 1 ? "" : "s"}`}
+            </div>
+          </div>
+          <Button size="sm" variant="outline-primary" onClick={handleStartNewHelpThread}>
+            New chat
+          </Button>
+        </div>
+
+        {!profileInsightsLoading && helpConversations.length === 0 ? (
+          <div className="profile-help-empty">
+            <strong>Start your first chat</strong>
+            <span>Send a short text or a voice note and the admin team will reply here.</span>
+          </div>
+        ) : (
+          <div className="profile-help-conversation-list">
+            {helpConversations.map((request) => (
+              <button
+                key={request.id}
+                type="button"
+                className={`profile-help-conversation-chip ${activeHelpRequest?.id === request.id ? "is-active" : ""}`}
+                onClick={() => handleOpenHelpBoard(request.id)}
+              >
+                <div className="profile-help-conversation-chip__top">
+                  <strong>{formatHelpTopicLabel(request.topic)}</strong>
+                  <span className={`badge text-capitalize ${request.adminReply ? "bg-success" : "bg-info text-dark"}`}>
+                    {request.adminReply ? "answered" : request.status || "open"}
+                  </span>
+                </div>
+                <div className="profile-help-conversation-chip__preview">
+                  {request.latestMessagePreview || request.message || "Voice message"}
+                </div>
+                <div className="profile-help-conversation-chip__time">
+                  {formatRelativeActivity(request.latestMessageAt || request.updatedAt || request.createdAt)}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="profile-help-thread-panel">
+        <div className="profile-help-thread-header">
+          <div>
+            <h6 className="mb-1">
+              {activeHelpRequest ? formatHelpTopicLabel(activeHelpRequest.topic) : "Start a new chat"}
+            </h6>
+            <div className="small text-muted">
+              {activeHelpRequest
+                ? `Started ${formatRelativeActivity(activeHelpRequest.createdAt)}`
+                : "Pick a topic, type a question, or record a voice note."}
+            </div>
+          </div>
+          {latestHelpReply?.id === activeHelpRequest?.id ? (
+            <span className="badge bg-success">Admin replied</span>
+          ) : null}
+        </div>
+
+        <div className="profile-help-thread">
+          {activeHelpRequest ? (
+            activeHelpMessages.map((message) => {
+              const roleName = message.role === "admin" ? "HandyMan team" : message.sentBy || "You";
+              return (
+                <div
+                  key={message.id}
+                  className={`profile-help-message profile-help-message--${message.role === "admin" ? "admin" : message.role === "system" ? "system" : "user"}`}
+                >
+                  <div className="profile-help-message__meta">
+                    <strong>{roleName}</strong>
+                    <span>{formatRelativeActivity(message.createdAt)}</span>
+                  </div>
+                  <div className="profile-help-message__bubble">
+                    {message.text ? <p className="mb-0">{message.text}</p> : null}
+                    {message.voiceNote?.dataUrl ? (
+                      <audio controls preload="none" className="profile-help-message__audio" src={message.voiceNote.dataUrl} />
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="profile-help-empty profile-help-empty--thread">
+              <strong>Hello from HandyMan support</strong>
+              <span>Tell us what you need today and we will keep the conversation going here.</span>
+            </div>
+          )}
+          <div ref={helpMessagesEndRef} />
+        </div>
+
+        <div className="profile-help-composer">
+          {!activeHelpRequest && (
+            <div className="mb-3">
+              <label className="form-label fw-bold">Topic</label>
+              <select
+                className="form-select"
+                value={helpRequestTopic}
+                onChange={(e) => setHelpRequestTopic(e.target.value)}
+              >
+                <option value="delivery">Delivery</option>
+                <option value="placing-orders">Placing orders</option>
+                <option value="offers">Offers</option>
+                <option value="other">Other questions</option>
+              </select>
+            </div>
+          )}
+
+          <div className="mb-2">
+            <label className="form-label fw-bold">
+              {activeHelpRequest ? "Continue the chat" : "Your message"}
+            </label>
+            <textarea
+              className="form-control"
+              rows={4}
+              maxLength={600}
+              value={helpRequestMessage}
+              onChange={(e) => setHelpRequestMessage(e.target.value)}
+              placeholder={activeHelpRequest ? "Type your reply here..." : "Type your question here..."}
+            />
+            <div className="text-muted small mt-1 text-end">
+              {helpRequestMessage.length}/600
+            </div>
+          </div>
+
+          {helpVoiceDraft && (
+            <div className="profile-help-voice-preview">
+              <div>
+                <strong>Voice message ready</strong>
+                <div className="small text-muted">
+                  {helpVoiceDraft.durationSeconds}s • {Math.max(1, Math.round((helpVoiceDraft.sizeBytes || 0) / 1024))} KB
+                </div>
+              </div>
+              <audio controls preload="none" src={helpVoiceDraft.dataUrl} />
+              <Button size="sm" variant="outline-secondary" onClick={clearHelpVoiceDraft}>
+                Remove voice note
+              </Button>
+            </div>
+          )}
+
+          <div className="profile-help-composer__actions">
+            <div className="profile-help-composer__secondary">
+              {canRecordHelpVoice ? (
+                isRecordingHelpVoice ? (
+                  <Button variant="danger" onClick={stopHelpVoiceRecording}>
+                    Stop recording
+                  </Button>
+                ) : (
+                  <Button variant="outline-primary" onClick={startHelpVoiceRecording}>
+                    Record voice message
+                  </Button>
+                )
+              ) : (
+                <span className="small text-muted">Voice messages work in supported browsers with microphone access.</span>
+              )}
+              {isRecordingHelpVoice && <span className="profile-help-recording-pill">Recording now...</span>}
+            </div>
+            <Button variant="primary" onClick={handleSubmitHelpRequest} disabled={submittingHelpRequest || isRecordingHelpVoice}>
+              {submittingHelpRequest
+                ? "Sending..."
+                : activeHelpRequest
+                  ? "Send message"
+                  : "Start chat"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Modal.Body>
+  <Modal.Footer>
+    <Button variant="secondary" onClick={handleCloseHelpBoard}>
+      Close chat
     </Button>
   </Modal.Footer>
 </Modal>
@@ -2023,6 +3064,7 @@ const filteredGroceryData = groceryData.filter((t) =>
        {displayProducts.map((product) => {
         const maxQty = getMaxAllowedQty(product);   
         const isOutOfStock = maxQty <= 0;
+        const imageSrc = getProductImageSrc(product.id);
           return (
             <div
         key={product.id}
@@ -2041,13 +3083,12 @@ const filteredGroceryData = groceryData.filter((t) =>
     className="d-flex justify-content-center align-items-center position-relative"
     style={{ height: "90px" }}
   >
-    {imageUrls[product.id] ? (
+    {imageSrc ? (
       <img
-        src={cartImages[product.id] || imageUrls[product.id]}
+        src={imageSrc}
         alt={product.name}
         decoding="async"
-        loading="eager"
-        fetchpriority="high"
+        loading="lazy"
         style={{
           maxHeight: "80px",
           maxWidth: "100%",
@@ -2056,11 +3097,11 @@ const filteredGroceryData = groceryData.filter((t) =>
           borderRadius: "6px",
         }}
         onClick={() => !isOutOfStock && handleImageClick(
-      cartImages[product.id] || imageUrls[product.id],
+      imageSrc,
       product
     )}/>
     ) : (
-      <span className="text-muted small">Loading Image</span>
+      renderImagePlaceholder(imageLoading ? "Loading image..." : "Image will appear shortly")
     )}
 
     {isOutOfStock && (
@@ -2861,6 +3902,119 @@ const filteredGroceryData = groceryData.filter((t) =>
     </Button>
   </Modal.Footer>
 </Modal>
+<div className="container mb-4">
+  <div className="card shadow-sm border-0">
+    <div className="card-body">
+      <div className="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
+        <div>
+          <h5 className="mb-1">Your activity and admin updates</h5>
+          <div className="text-muted small">
+            Track recent activity, notification status, and messages sent from the admin dashboard.
+          </div>
+        </div>
+        <div className="d-flex gap-2 flex-wrap">
+          <span className={`badge ${notificationPermission === "granted" ? "bg-success" : notificationPermission === "denied" ? "bg-danger" : "bg-warning text-dark"}`}>
+            Notifications: {notificationPermission}
+          </span>
+          <span className="badge bg-primary">
+            Active time: {formatActivityDuration(userActivitySummary?.totalActiveSeconds)}
+          </span>
+          <Button size="sm" variant="outline-primary" onClick={handleOpenHelpBoard}>
+            Help board
+          </Button>
+          {notificationPermission !== "granted" && (
+            <Button size="sm" variant="outline-success" onClick={handleOpenPushPrompt}>
+              {notificationPermission === "denied" ? "Fix notifications" : "Enable notifications"}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="row g-3 mb-3">
+        <div className="col-md-4">
+          <div className="border rounded p-3 h-100 bg-light">
+            <div className="text-muted small">Last active</div>
+            <div className="fw-bold">{formatRelativeActivity(userActivitySummary?.lastActiveAt || userActivitySummary?.lastSeenAt)}</div>
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="border rounded p-3 h-100 bg-light">
+            <div className="text-muted small">Tracked actions</div>
+            <div className="fw-bold">{userActivitySummary?.totalEvents || 0} events</div>
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="border rounded p-3 h-100 bg-light">
+            <div className="text-muted small">Unread admin messages</div>
+            <div className="fw-bold">{userActivitySummary?.unreadMessages || profileMessages.length || 0}</div>
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="border rounded p-3 h-100 bg-light">
+            <div className="text-muted small">Your help requests</div>
+            <div className="fw-bold">{helpRequests.length || 0}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+        <h6 className="mb-0">Messages below your profile page</h6>
+        {profileInsightsLoading && <span className="small text-muted">Refreshing activity...</span>}
+      </div>
+
+      {!profileInsightsLoading && profileMessages.length === 0 && (
+        <div className="border rounded p-3 text-muted bg-light">
+          No admin messages yet. New promotions and announcements will appear here.
+        </div>
+      )}
+
+      <div className="d-flex flex-column gap-3">
+        {profileMessages.map((message) => (
+          <div key={message.id} className="border rounded p-3 bg-white shadow-sm">
+            <div className="d-flex justify-content-between align-items-start flex-wrap gap-2">
+              <div>
+                <div className="fw-bold">{message.title || "HandyMan update"}</div>
+                <div className="small text-muted">{formatRelativeActivity(message.createdAt)}</div>
+              </div>
+              {message.offerCode && (
+                <span className="badge bg-warning text-dark">Code: {message.offerCode}</span>
+              )}
+            </div>
+            <p className="mb-2 mt-2">{message.body}</p>
+            {message.ctaUrl && (
+              <Button size="sm" variant="outline-primary" onClick={() => handleProfileMessageAction(message)}>
+                {message.ctaLabel || "Open"}
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  </div>
+</div>
+
+<button
+  type="button"
+  className="profile-help-chat-launcher"
+  onClick={() => handleOpenHelpBoard()}
+  aria-label="Open help assistant chat"
+  title="Open help assistant chat"
+>
+  <span className="profile-help-chat-icon" aria-hidden="true">
+    <SupportAgentIcon style={{ fontSize: "22px" }} />
+  </span>
+  <span className="profile-help-chat-copy">
+    <strong>Help assistant</strong>
+    <small>
+      {latestHelpReply
+        ? "Admin replied. Continue the conversation here."
+        : "Chat with us about orders, offers, or delivery."}
+    </small>
+  </span>
+  <span className="profile-help-chat-badge">
+    {latestHelpReply ? "!" : helpRequests.length || <HelpOutlineIcon style={{ fontSize: "18px" }} />}
+  </span>
+</button>
          <Footer />
         </>    
   );

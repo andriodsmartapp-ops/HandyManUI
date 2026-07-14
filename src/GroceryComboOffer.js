@@ -30,9 +30,7 @@ const fetchImage = async (photo, signal) => {
 
   const cached = await ImageCache.getBase64(photo);
   if (cached) {
-    const dataUrl = `data:image/jpeg;base64,${cached}`;
-    ImageCache.setBlobUrl(photo, dataUrl); 
-    return dataUrl;
+    return ImageCache.getOrCreateObjectUrl(photo, cached);
   }
 
   try {
@@ -43,10 +41,8 @@ const fetchImage = async (photo, signal) => {
     const json = await res.json();
     const b64 = json?.imageData || "";
     if (b64) {
-      const dataUrl = `data:image/jpeg;base64,${b64}`;
-      await ImageCache.setBase64(photo, b64);       
-      ImageCache.setBlobUrl(photo, dataUrl);         
-      return dataUrl;
+      await ImageCache.setBase64(photo, b64);
+      return ImageCache.getOrCreateObjectUrl(photo, b64);
     }
   } catch (err) {
     console.error("fetchImage failed:", err); 
@@ -150,7 +146,15 @@ const SubProductCard = ({ name, selected, onSelect, image, loading }) => (
       {loading ? (
         <div style={{ width: 40, height: 40, borderRadius: "50%", background: "#e5e7eb" }} />
       ) : image ? (
-        <img src={image} alt={name} style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
+        <img
+          src={image}
+          alt={name}
+          loading="lazy"
+          decoding="async"
+          width="72"
+          height="72"
+          style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+        />
       ) : (
         <span style={{ fontSize: 28 }}>🛒</span>
       )}
@@ -501,7 +505,13 @@ const GroceryComboOffer = () => {
           )}
           {mainImg ? (
             <img
-              src={mainImg} alt={mainProduct?.name || ""}
+              src={mainImg}
+              alt={mainProduct?.name || ""}
+              loading="eager"
+              fetchPriority="high"
+              decoding="async"
+              width="320"
+              height="320"
               style={{ maxHeight: 160, maxWidth: "100%", objectFit: "contain", borderRadius: 12 }}
             />
           ) : (
